@@ -1,0 +1,614 @@
+---
+title: "Parking Occupancy Prediction in Seattle"
+author: "Alex Abramson and Shuyan Hong"
+date: "December 21, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r import libraries, include=FALSE, cache = FALSE, echo=FALSE}
+
+library(sf)
+library(tidyverse)
+library(lubridate)
+library(openxlsx)
+library(ggplot2)
+library(RSocrata)
+library(tidyr)
+library(ggsn)
+library(ggspatial)
+library(censusapi)
+library(tigris)
+library(tidycensus)  #For obtaining census data (although Ken strongly recommends against using census data to power this regression)
+library(caret) 
+library(jsonlite)
+library(LogicReg)
+library(kableExtra)
+library(xtable)
+library(FNN)
+library(lazyeval)
+```
+
+
+```{r other setup, include=FALSE, cache = TRUE, echo=FALSE}
+mapTheme <- function(base_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = 14,colour = "black"),
+    plot.subtitle=element_text(face="italic"),
+    plot.caption=element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=2)
+  )
+}
+
+nn_function <- function(measureFrom,measureTo,k) {
+  
+  nn <-   
+    get.knnx(measureTo, measureFrom, k)$nn.dist
+  
+  output <-
+    as.data.frame(nn) %>%
+    rownames_to_column(var = "thisPoint") %>%
+    gather(points, point_distance, V1:ncol(.)) %>%
+    arrange(as.numeric(thisPoint)) %>%
+    group_by(thisPoint) %>%
+    summarize(pointDistance = mean(point_distance)) %>%
+    arrange(as.numeric(thisPoint)) %>% 
+    dplyr::select(-thisPoint)
+  
+  return(output)  
+}
+
+" create_Matrix_function <- function(dataframe, xVarNameString, yVarNameString) {
+    
+  output <- 
+    dataframe %>%
+    mutate(xVar = interp(~mean(x), x = quote(xVarNameString))) %>%
+    mutate(yVar = interp(~mean(y), y = quote(yVarNameString))) %>%
+    dplyr::select(xVar,yVar) %>%
+    mutate(X = as.numeric(xVar)) %>%
+    mutate(Y = as.numeric(yVar)) %>%
+    as.matrix()
+  return(output)
+}"
+
+#buildingPermitsMatrix <- create_Matrix_function(building_permits, Longitude, Latitude)
+
+#census_api_key("6c85763c8434095db97a9c18bafc135c98ec62a5", install = TRUE)  #Key to use the census download API.
+options(scipen=999)
+```
+
+```{r import parking data, include=FALSE, cache = TRUE, echo=FALSE}
+raw_parking_data <- read.socrata("https://data.seattle.gov/Transportation/Annual-Parking-Study-Data/7jzm-ucez")
+```
+
+```{r clean parking data, include=FALSE, echo=FALSE, cache = TRUE}
+Parking_data <-
+  raw_parking_data %>%
+  distinct() %>%
+  dplyr::filter(is.na(Unitdesc)==FALSE) %>%
+  dplyr::filter(Sub_Area != "ERROR: #N/A") %>%
+  dplyr::filter(Total_Vehicle_Count >= 0) %>%
+  mutate(DateTimeUse = mdy_hms(Date.Time)) %>% #as.POSIXct(as.numeric(Date.Time)*24*3600 + as.POSIXct("1899-12-30 00:00") )) %>%
+  mutate(hour = hour(DateTimeUse),
+         month = month(DateTimeUse),
+         year = year(DateTimeUse),
+         dtw = wday(DateTimeUse)) %>%
+  mutate(monThurs = if_else(dtw>=2 & dtw <= 5,1,0),
+         fri = if_else(dtw == 6,1,0),
+         weekend = if_else(dtw == 1 | dtw == 7,1,0)) %>%
+  mutate(weekday = if_else(monThurs == 1 | fri == 1,1,0)) %>%
+  mutate(morningRush = if_else(weekday == 1 & hour >= 8 & hour <= 9,1,0),
+         eveningRush = if_else(weekday == 1 & hour >= 16 & hour <= 18,1,0),
+         postWork = if_else(weekday == 1 & hour >= 18,1,0),
+         workLunch = if_else(weekday == 1 & hour >= 11 & hour <= 1,1,0)) %>%
+  mutate(fallSeas = if_else(month >=9 & month <= 11,1,0),
+         winterSeas = if_else(month >=12 & month <= 2,1,0),
+         springSeas = if_else(month >=3 & month <= 5,1,0),
+         summerSeas = if_else(month >=6 & month <= 8,1,0)) %>%
+  mutate(yr17 = if_else(year == 2017,1,0),
+         yr16 = if_else(year == 2016,1,0),
+         yr15 = if_else(year == 2015,1,0),
+         yr14 = if_else(year == 2014,1,0)) %>%
+  mutate(dateVal = mdy(substr(Date.Time,0,7))) %>%
+  mutate(Construction = if_else(Construction == "no","No",if_else(Construction == "yes","Yes",Construction))) %>%
+  mutate(Construction = if_else(Construction == "Yes",1,0)) %>%
+  mutate(Event.Closure = if_else(Event.Closure == "Yes",1,0)) %>%
+  mutate(peakHour = if_else(Peak.Hour...Yes.or.No.=="Yes","YES",Peak.Hour...Yes.or.No.)) %>%
+  mutate(Study_Area_Condensed = if_else(Study_Area == "12th Ave - Weekday" | Study_Area == "12th Ave 2017 Annual Study" ,"12th Avenue",if_else(Study_Area == "Ballard - Weekday","Ballard",if_else(Study_Area == "Ballard Locks - Weekday (Spring)" | Study_Area == "Ballard Locks - Weekday (Summer)" | Study_Area == "Ballard Locks Spring" |Study_Area == "Ballard Locks Spring 2017" |Study_Area == "Ballard Locks summer" |Study_Area == "Ballard Locks Summer" ,"Ballard Locks",if_else(Study_Area == "Belltown - Weekday" ,"Belltown",if_else(Study_Area == "Capitol Hill - Weekday" ,"Capitol Hill",if_else(Study_Area == "Cherry Hill - Weekday" ,"Cherry Hill",if_else(Study_Area == "Chinatown ID 2017" | Study_Area == "Chinatown/ID - Event" | Study_Area == "Chinatown/ID - Sunday" | Study_Area == "Chinatown/ID - Weekday","Chinatown/ID",if_else(Study_Area == "Commercial Core - Event Day" | Study_Area == "Commercial Core - Financial" | Study_Area == "Commercial Core - Retail" | Study_Area == "Commercial Core - Waterfront" | Study_Area == "Commercial Core - Weekday" | Study_Area == "Commercial Core Financial" | Study_Area == "Commercial Core Retail" | Study_Area == "Commercial Core Waterfront","Commercial Core",if_else(Study_Area == "Denny Triangle - Weekday" | Study_Area == "Denny Triangle North" | Study_Area == "Denny Triangle North - 2017" | Study_Area == "Denny Triangle South" | Study_Area == "Denny Triangle South - 2017","Denny Triangle",if_else(Study_Area == "First Hill - Weekday","First Hill",if_else(Study_Area == "Fremont - Weekday","Fremont",if_else(Study_Area == "Green Lake - Weekday" | Study_Area == "Greenlake","Green Lake",if_else(Study_Area == "Little Saigon - Sunday" | Study_Area == "Little Saigon - Weekday","Little Saigon",if_else(Study_Area == "Pike-Pine - Weekday","Pike-Pine",if_else(Study_Area == "Pioneer Square - Event Day" | Study_Area == "Pioneer Square - Sunday" | Study_Area == "Pioneer Square - Weekday" | Study_Area == "Pioneer Square 2017","Pioneer Square",if_else(Study_Area == "Roosevelt - Weekday","Roosevelt",if_else(Study_Area == "South Lake Union - Weekday","South Lake Union",if_else(Study_Area == "University District - Weekday","University District",if_else(Study_Area == "Uptown - Sunday" | Study_Area == "Uptown - Weekday","Uptown",if_else(Study_Area == "Uptown Triangle - Weekday","Uptown Triangle",if_else(Study_Area == "Westlake - Weekday","Westlake",Study_Area))))))))))))))))))))))
+```
+
+```{r import street centerline data, include=FALSE, cache = TRUE, echo=FALSE}
+raw_street_centerlines <- st_read(
+  "C:/Users/alexc/Documents/MUSA/Fall/Applied_Spatial_Analysis/final_project/Final_project/finalProject/Seattle_Streets/Seattle_Streets.shp")
+```
+
+```{r clean and prepare street centerline data, include=FALSE, cache = TRUE}
+#find centroid lat longs of street centerlines
+street_centerlines_lat_long <-
+  raw_street_centerlines %>%
+  mutate(centroid = st_centroid(geometry)) %>%
+  st_centroid(geometry) %>%
+  #dplyr::select(streetUniID,centroid) %>%
+  st_set_geometry(NULL) %>%
+  st_sf %>%
+  st_coordinates()
+#join lat longs of centroids to street centerline linestrings
+street_centerlines <-
+  raw_street_centerlines %>%
+  mutate(streetUniID = row_number(),
+         UNITDESC = as.character(UNITDESC))  %>%
+  mutate(TRANCLASS = if_else(TRANCLASS == 3,1,if_else(TRANCLASS == 1,3,TRANCLASS))) %>%
+  mutate(centroid = st_centroid(geometry)) %>%
+  st_sf() %>%
+  cbind(street_centerlines_lat_long)
+```
+
+```{r join street centerlines to parking data, include=FALSE, cache = TRUE}
+parking_geo <- 
+  Parking_data %>%
+  left_join(street_centerlines %>% dplyr::select(ARTCLASS,ARTDESCRIP,STATUS,SPEEDLIMIT,ONEWAY,SEGLENGTH,SURFACEWID,SURFACETYP,STREETTYPE,PVMTCONDIN,TRANCLASS,TRANDESCRI,PVMTCATEGO,SLOPE_PCT,UNITDESC, geometry, centroid, streetUniID, X, Y), by = c("Unitdesc"="UNITDESC")) %>%
+  dplyr::filter(is.na(streetUniID) == FALSE) %>%
+  mutate(occRate = if_else(Parking_Spaces != 0,100*(Total_Vehicle_Count/Parking_Spaces),NULL)) %>%
+  mutate(vacRate = if_else(occRate > 100,0,100 - (occRate))) %>%
+  mutate(isFull = as.factor(if_else(occRate >= 100, 1, 0))) %>%
+  st_as_sf()
+```
+
+```{r remove unknown data and duplicates, include=FALSE, cache = TRUE}
+parking_geo_1 <- 
+  parking_geo %>% 
+  dplyr::filter(Parking_Spaces != 0 ) %>%
+  mutate(parkUniID = row_number()) %>%
+  arrange(Date.Time, Unitdesc)
+```
+
+```{r Generates mean occupancy rates for each blockface-hour pair between 2014-2017 data, include=FALSE, cache = TRUE}
+parking_geo_2 <- 
+  parking_geo_1 %>%
+  dplyr::filter(year != 2018) %>%
+  arrange(Unitdesc, hour, year) %>%
+  group_by(Unitdesc, hour) %>%
+  dplyr::summarize(meanOccRateThisHrThisBlkfc = mean(occRate)) %>%
+  mutate(UnitdescHour = paste(as.character(Unitdesc),"with hour of ", as.character(hour))) %>%
+  group_by(Unitdesc) %>%
+  mutate(meanOccRateLastHrThisBlkfc = lag(meanOccRateThisHrThisBlkfc, n = 1),
+         meanOccRateNextHrThisBlkfc = lead(meanOccRateThisHrThisBlkfc, n = 1))
+```
+
+```{r Generates mean occupancy rates for each blockface between 2014-2017 data, include=FALSE, cache = TRUE}
+parking_geo_3 <-
+  parking_geo_1 %>%
+  dplyr::filter(year != 2018) %>%
+  arrange(Unitdesc, hour, year) %>%
+  group_by(Unitdesc, year) %>%
+  dplyr::summarize(meanOccRateThisYrThisBlkfc = mean(occRate)) %>%
+  mutate(yearStr = paste("c",as.character(year),"c", sep = "")) %>%
+  dplyr::select(-year) %>%
+  spread(yearStr, meanOccRateThisYrThisBlkfc) %>%
+  mutate(latestYr = if_else(is.na(c2017c)==FALSE, c2017c, if_else(is.na(c2016c)==FALSE, c2016c, if_else(is.na(c2015c)==FALSE, c2015c, if_else(is.na(c2014c)==FALSE, c2014c, NULL))))) %>%
+  mutate(earliestYr = if_else(is.na(c2014c)==FALSE, c2014c, if_else(is.na(c2015c)==FALSE, c2015c, if_else(is.na(c2016c)==FALSE, c2016c, if_else(is.na(c2017c)==FALSE, c2017c, NULL))))) %>%
+  mutate(avgYearOccRateByBlockPctChange = (latestYr - earliestYr))
+```
+
+```{r Generates mean occupancy rates for each blockface over whole time period data, include=FALSE, cache = TRUE}
+parking_geo_distinct_Unitdesc <-
+  parking_geo_1 %>%
+  dplyr::filter(year != 2018) %>%
+  arrange(Unitdesc, hour, year) %>%
+  group_by(Unitdesc) %>%
+  dplyr::summarize(meanOccRateThisBlkfc = mean(occRate),
+                   X = mean(as.numeric(X)),
+                   Y = mean(as.numeric(Y))) %>%
+  st_set_geometry(NULL) %>%
+  mutate(joinRowNum = row_number())
+```
+
+```{r joining mean occRates from _2, _3, and _distinct_Unitdesc, include=FALSE, cache = TRUE}
+parking_geo_4 <-
+  parking_geo_1 %>%
+  mutate(UnitdescHour = paste(as.character(Unitdesc),"with hour of ", as.character(hour))) %>%
+  left_join(as.data.frame(parking_geo_2 %>% dplyr::select(meanOccRateThisHrThisBlkfc, meanOccRateLastHrThisBlkfc, meanOccRateNextHrThisBlkfc, UnitdescHour) %>% st_set_geometry(NULL)), by = c("UnitdescHour" = "UnitdescHour")) %>%
+  mutate(Unitdesc = Unitdesc.x) %>%
+  select(-Unitdesc.y, -Unitdesc.x, -UnitdescHour) %>%
+  left_join(as.data.frame(parking_geo_3 %>% dplyr::select(avgYearOccRateByBlockPctChange,latestYr,earliestYr, Unitdesc) %>% st_set_geometry(NULL)), by = c("Unitdesc" = "Unitdesc")) %>%
+  left_join(as.data.frame(parking_geo_distinct_Unitdesc %>% dplyr::select(meanOccRateThisBlkfc, Unitdesc, joinRowNum) ), by = c("Unitdesc" = "Unitdesc"))
+```
+
+```{r create blockface matrix, include=FALSE, cache = TRUE}
+BlockfacesXYMatrix <-
+  parking_geo_distinct_Unitdesc %>%
+  select(X,Y) %>%
+  mutate(X = as.numeric(X)) %>%
+  mutate(Y = as.numeric(Y)) %>%
+  as.matrix()
+```
+
+```{r add in handcrafted parking rate data, include=FALSE, cache = TRUE}
+parkingRates2018 <- read.xlsx("C:/Users/alexc/Documents/MUSA/Fall/Applied_Spatial_Analysis/final_project/Final_project/finalProject/parkingRates.xlsx", sheet = 1,colNames = TRUE,detectDates = FALSE)
+```
+
+```{r bring in background geographic data, include=FALSE, cache = TRUE}
+options(tigris_year = 2010)
+#Zip codes
+#zipcodes <- read.socrata("https://catalog.data.gov/dataset/seattle-city-limits-7c1ba")
+
+#Tracts
+tracts_2010 <- tracts(state = 'WA', county = c('King'))
+tracts_2010 <- st_as_sf(tracts_2010) %>% st_transform(st_crs(parking_geo))
+
+#Block groups
+blockgroups_2010 <- block_groups(state = 'WA', county = c('King'))
+blockgroups_2010 <- st_as_sf(blockgroups_2010) %>% st_transform(st_crs(parking_geo))
+
+#Blocks
+blocks_10 <- blocks(state = 'WA', county = c('King'))
+blocks_10 <- st_as_sf(blocks_10) %>% st_transform(st_crs(parking_geo))
+
+#City Limits
+cityLimits <- st_read("C:/Users/alexc/Documents/MUSA/Fall/Applied_Spatial_Analysis/final_project/Final_project/finalProject/Seattle_City_Limits/Seattle_City_Limits.shp")
+
+#Study Area
+
+studyArea <- as.data.frame(matrix(c(47.75,-122.4252,47.75,-122.2384,47.55,-122.2384,47.55,-122.4252,47.75,-122.4252)  ## need to close the polygon
+                                  , ncol =2, byrow = T, dimnames = list(c("topLeft", "topRight", "bottomRight", "bottomLeft", "topLeft"), c("Y","X"))
+)) 
+studyArea <- st_as_sf(studyArea, coords = c("X", "Y"), crs = 4326)
+```
+
+```{r Bring in new variables, include=FALSE, cache = TRUE}
+#New Developments
+raw_building_permits <- read.socrata("https://data.seattle.gov/Permitting/Building-Permit-Map/pdne-cjsw")
+
+#Business Licenses
+raw_business_licenses <- read.socrata("https://data.seattle.gov/City-Business/Active-Business-License-Tax-Certificate/wnbq-64tb")
+```
+
+```{r cleaning building permits data, include=FALSE, cache = TRUE}
+business_licenses <- 
+  raw_business_licenses %>%
+  mutate(automotive = if_else(as.numeric(NAICS.Code) >= 441000 & as.numeric(NAICS.Code) < 443000,1,0),
+         electronics_stores = if_else(as.numeric(NAICS.Code) >= 443000 & as.numeric(NAICS.Code) < 444000,1,0),
+         home_building_stores = if_else(as.numeric(NAICS.Code) >= 444000 & as.numeric(NAICS.Code) < 445000,1,0),
+         food_bev_stores = if_else(as.numeric(NAICS.Code) >= 445000 & as.numeric(NAICS.Code) < 446000,1,0),
+         health_stores = if_else(as.numeric(NAICS.Code) >= 446000 & as.numeric(NAICS.Code) < 447000,1,0),
+         gas_stations = if_else(as.numeric(NAICS.Code) >= 447000 & as.numeric(NAICS.Code) < 448000,1,0),
+         clothing_accessories_stores = if_else(as.numeric(NAICS.Code) >= 448000 & as.numeric(NAICS.Code) < 449000,1,0),
+         all_other_stores = if_else(as.numeric(NAICS.Code) >= 451000 & as.numeric(NAICS.Code) < 454000,1,0),
+         all_retail = if_else(as.numeric(NAICS.Code) >= 441000 & as.numeric(NAICS.Code) < 454000,1,0))
+
+building_permits <-
+  raw_building_permits %>%
+  mutate(year = year(ymd(AppliedDate))) %>%
+  dplyr::filter(year > 2014) %>%
+  dplyr::filter(is.na(Longitude) == FALSE & is.na(Latitude) == FALSE)
+vacant_land_permits <-
+  building_permits %>%
+  dplyr::filter(PermitClass == "Vacant Land")
+new_cons_permits <-
+  building_permits %>%
+  dplyr::filter(PermitTypeDesc == "New" | PermitTypeDesc == "Addition/Alteration")
+single_fam_building_permits <-
+  building_permits %>%
+  dplyr::filter(PermitTypeDesc == "New" | PermitTypeDesc == "Addition/Alteration") %>%
+  dplyr::filter(PermitClass == "Single Family/Duplex")
+multifamily_building_permits <-
+  building_permits %>%
+  dplyr::filter(PermitTypeDesc == "New" | PermitTypeDesc == "Addition/Alteration") %>%
+  dplyr::filter(PermitClass == "Multifamily")
+commercial_building_permits <-
+  building_permits %>%
+  dplyr::filter(PermitTypeDesc == "New" | PermitTypeDesc == "Addition/Alteration") %>%
+  dplyr::filter(PermitClass == "Commercial")
+institutional_building_permits <-
+  building_permits %>%
+  dplyr::filter(PermitTypeDesc == "New" | PermitTypeDesc == "Addition/Alteration") %>%
+  dplyr::filter(PermitClass == "Institutional")
+demolition_permits <-
+  building_permits %>%
+  dplyr::filter(PermitTypeDesc == "Demolition")
+
+
+building_PermitsMatrix <- building_permits %>% select(Longitude,Latitude) %>% as.matrix()
+vacant_land_permitsMatrix <- vacant_land_permits %>% select(Longitude,Latitude) %>% as.matrix()
+new_cons_permitsMatrix <- new_cons_permits %>% select(Longitude,Latitude) %>% as.matrix()
+single_fam_building_permitsMatrix <- single_fam_building_permits %>% select(Longitude,Latitude) %>% as.matrix()
+multifamily_building_permitsMatrix <- multifamily_building_permits %>% select(Longitude,Latitude) %>% as.matrix()
+commercial_building_permitsMatrix <- commercial_building_permits %>% select(Longitude,Latitude) %>% as.matrix()
+institutional_building_permitsMatrix <- institutional_building_permits %>% select(Longitude,Latitude) %>% as.matrix()
+demolition_permitsMatrix <- demolition_permits %>% select(Longitude,Latitude) %>% as.matrix()
+```
+
+```{r preparing building permits data, include=FALSE, cache = TRUE}
+parking_geo_5 <-
+  parking_geo_distinct_Unitdesc %>%
+  cbind(nn_function(BlockfacesXYMatrix,building_PermitsMatrix,2) %>% mutate(avgDist2BuildingPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,building_PermitsMatrix,5) %>% mutate(avgDist5BuildingPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,building_PermitsMatrix,10) %>% mutate(avgDist10BuildingPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,building_PermitsMatrix,15) %>% mutate(avgDist15BuildingPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,building_PermitsMatrix,25) %>% mutate(avgDist25BuildingPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,new_cons_permitsMatrix,2) %>% mutate(avgDist2NewConsPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,new_cons_permitsMatrix,5) %>% mutate(avgDist5NewConsPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,new_cons_permitsMatrix,10) %>% mutate(avgDist10NewConsPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,new_cons_permitsMatrix,15) %>% mutate(avgDist15NewConsPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,new_cons_permitsMatrix,25) %>% mutate(avgDist25NewConsPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,single_fam_building_permitsMatrix,2) %>% mutate(avgDist2SingleFamPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,single_fam_building_permitsMatrix,5) %>% mutate(avgDist5SingleFamPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,single_fam_building_permitsMatrix,10) %>% mutate(avgDist10SingleFamPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,single_fam_building_permitsMatrix,15) %>% mutate(avgDist15SingleFamPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,single_fam_building_permitsMatrix,25) %>% mutate(avgDist25SingleFamPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,multifamily_building_permitsMatrix,2) %>% mutate(avgDist2MultifamilyPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,multifamily_building_permitsMatrix,5) %>% mutate(avgDist5MultifamilyPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,multifamily_building_permitsMatrix,10) %>% mutate(avgDist10MultifamilyPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,multifamily_building_permitsMatrix,15) %>% mutate(avgDist15MultifamilyPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,multifamily_building_permitsMatrix,25) %>% mutate(avgDist25MultifamilyPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,commercial_building_permitsMatrix,2) %>% mutate(avgDist2CommercialPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,commercial_building_permitsMatrix,5) %>% mutate(avgDist5CommercialPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,commercial_building_permitsMatrix,10) %>% mutate(avgDist10CommercialPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,commercial_building_permitsMatrix,15) %>% mutate(avgDist15CommercialPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,commercial_building_permitsMatrix,25) %>% mutate(avgDist25CommercialPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,institutional_building_permitsMatrix,2) %>% mutate(avgDist2InstitutionalPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,institutional_building_permitsMatrix,5) %>% mutate(avgDist5InstitutionalPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,institutional_building_permitsMatrix,10) %>% mutate(avgDist10InstitutionalPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,institutional_building_permitsMatrix,15) %>% mutate(avgDist15InstitutionalPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,institutional_building_permitsMatrix,25) %>% mutate(avgDist25InstitutionalPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,demolition_permitsMatrix,2) %>% mutate(avgDist2DemoPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,demolition_permitsMatrix,5) %>% mutate(avgDist5DemoPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,demolition_permitsMatrix,10) %>% mutate(avgDist10DemoPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,demolition_permitsMatrix,15) %>% mutate(avgDist15DemoPermits = pointDistance) %>% dplyr::select(-pointDistance)) %>%
+  cbind(nn_function(BlockfacesXYMatrix,demolition_permitsMatrix,25) %>% mutate(avgDist25DemoPermits = pointDistance) %>% dplyr::select(-pointDistance))
+```
+
+```{r creating spatial lag data, include=FALSE, cache = TRUE}
+NearestBlockfacesNN = get.knnx(BlockfacesXYMatrix,BlockfacesXYMatrix,k=5)
+parking_geo_7 <-
+  NearestBlockfacesNN$nn.index %>%
+  as.data.frame() %>%
+  cbind(parking_geo_distinct_Unitdesc %>% dplyr::select(Unitdesc)) %>%
+  mutate(trueUnitdesc = Unitdesc) %>%
+  dplyr::select(-Unitdesc) %>%
+  gather(key = "position", value = nearest, V2:V5) %>%
+  cbind(NearestBlockfacesNN$nn.dist %>% as.data.frame() %>% mutate(joinRowNum = row_number()) %>% select(-V1) %>% gather(key = "position", value = distance, V2:V5) %>% arrange(position) %>% select(-position, -joinRowNum)) %>%
+  arrange(V1) %>%
+  left_join(parking_geo_4 %>% dplyr::select(Unitdesc, avgYearOccRateByBlockPctChange, latestYr, earliestYr, meanOccRateThisBlkfc, joinRowNum) %>% group_by(Unitdesc) %>% dplyr::filter(row_number() == 1) %>% st_set_geometry(NULL), by = c("nearest" = "joinRowNum")) %>%
+  mutate(wtdAvgYearOccRateByBlockPctChange = distance*avgYearOccRateByBlockPctChange,
+         wtdLatestYr = distance*latestYr,
+         wtdEarliestYr = distance*earliestYr,
+         wtdmeanOccRateThisBlkfc = distance*meanOccRateThisBlkfc) %>%
+  group_by(trueUnitdesc) %>%
+  summarise(mean5NNavgYearOccRateByBlockPctChange = mean(avgYearOccRateByBlockPctChange),
+            mean5NNlatestYr = mean(latestYr),
+            mean5NNearliestYr = mean(earliestYr),
+            mean5NNmeanOccRateThisBlkfc = mean(meanOccRateThisBlkfc),
+            mean5NNwtdAvgYearOccRateByBlockPctChange = mean(wtdAvgYearOccRateByBlockPctChange),
+            mean5NNwtdLatestYr = mean(wtdLatestYr),
+            mean5NNwtdEarliestYr = mean(wtdEarliestYr),
+            mean5NNwtdmeanOccRateThisBlkfc = mean(wtdmeanOccRateThisBlkfc))
+```
+
+```{r joining spatial lag, building permit, and parking rate data back to main dataset, include=FALSE, cache = TRUE}
+parking_geo_6 <-
+  parking_geo_4 %>%
+  left_join(parking_geo_5 %>% select(-joinRowNum, -meanOccRateThisBlkfc, -X, -Y), by = c("Unitdesc"="Unitdesc")) %>%
+  left_join(parking_geo_7, by = c("Unitdesc"="trueUnitdesc")) %>%
+  left_join(parkingRates2018, by = c("Study_Area"="Neighborhood","Sub_Area"="Subarea")) %>%
+  mutate
+```
+
+```{r formulas, include=FALSE, cache = TRUE}
+regFormula <- occRate ~ Construction + Event.Closure + as.factor(Study_Area_Condensed) + Study.Year + as.factor(peakHour) + as.factor(hour) + as.factor(month) + as.factor(dtw) + meanOccRateThisHrThisBlkfc + meanOccRateLastHrThisBlkfc + meanOccRateNextHrThisBlkfc + avgYearOccRateByBlockPctChange + meanOccRateThisBlkfc + morningRush + eveningRush + workLunch + postWork + as.factor(peakHour) + springSeas + summerSeas +weekday + monThurs + fri + ARTCLASS + as.factor(ARTCLASS) + SPEEDLIMIT + as.factor(ONEWAY) + SURFACEWID + as.factor(SURFACETYP) + as.factor(STREETTYPE) + TRANCLASS + PVMTCONDIN + SLOPE_PCT  #+ as.factor(RPZ.Blocks) + as.factor(CSM) + morningRush + eveningRush + workLunch + postWork + as.factor(ARTCLASS) + as.factor(ARTDESCRIP) + SPEEDLIMIT + as.factor(ONEWAY) + SURFACEWID + as.factor(SURFACETYP) + as.factor(STREETTYPE) + TRANCLASS + PVMTCONDIN + SLOPE_PCT
+regFormula_1 <- isFull ~ Construction + Event.Closure + as.factor(Study_Area_Condensed) + Study.Year + as.factor(peakHour) + as.factor(hour) + as.factor(month) + as.factor(dtw) + meanOccRateThisHrThisBlkfc + meanOccRateLastHrThisBlkfc + meanOccRateNextHrThisBlkfc + avgYearOccRateByBlockPctChange + meanOccRateThisBlkfc + morningRush + eveningRush + workLunch + postWork + as.factor(peakHour) + springSeas + summerSeas +weekday + monThurs + fri + ARTCLASS + as.factor(ARTCLASS) + SPEEDLIMIT + as.factor(ONEWAY) + SURFACEWID + as.factor(SURFACETYP) + as.factor(STREETTYPE) + TRANCLASS + PVMTCONDIN + SLOPE_PCT + avgDist10BuildingPermits 	+ avgDist10CommercialPermits 	+ avgDist10DemoPermits 	+ avgDist10InstitutionalPermits 	+ avgDist10MultifamilyPermits 	+ avgDist10NewConsPermits 	+ avgDist10SingleFamPermits 	+ avgDist15BuildingPermits 	+ avgDist15CommercialPermits 	+ avgDist15DemoPermits 	+ avgDist15InstitutionalPermits 	+ avgDist15MultifamilyPermits 	+ avgDist15NewConsPermits 	+ avgDist15SingleFamPermits 	+ avgDist25BuildingPermits 	+ avgDist25CommercialPermits 	+ avgDist25DemoPermits 	+ avgDist25InstitutionalPermits 	+ avgDist25MultifamilyPermits 	+ avgDist25NewConsPermits 	+ avgDist25SingleFamPermits 	+ avgDist2BuildingPermits 	+ avgDist2CommercialPermits 	+ avgDist2DemoPermits 	+ avgDist2InstitutionalPermits 	+ avgDist2MultifamilyPermits 	+ avgDist2NewConsPermits 	+ avgDist2SingleFamPermits 	+ avgDist5BuildingPermits 	+ avgDist5CommercialPermits 	+ avgDist5DemoPermits 	+ avgDist5InstitutionalPermits 	+ avgDist5MultifamilyPermits 	+ avgDist5NewConsPermits 	+ avgDist5SingleFamPermits + mean5NNavgYearOccRateByBlockPctChange + mean5NNlatestYr + mean5NNearliestYr + mean5NNmeanOccRateThisBlkfc + mean5NNwtdAvgYearOccRateByBlockPctChange + mean5NNwtdLatestYr + mean5NNwtdEarliestYr + mean5NNwtdmeanOccRateThisBlkfc + PriceMorning18 	+ PriceMorning16 	+ PriceMidday17 	+ PriceEvening18 	+ PriceEvening15 	+ AbsChg1718Eve 	+ PriceTrendEve4Yr 	+ PriceTrendEve2Yr 	+ PriceMorning15 	+ PriceMidday16 	+ PriceEvening17 	+ AbsChg1718Morn 	+ PriceTrendMorn4Yr 	+ PriceTrendMorn2Yr 	+ PriceMidday18 	+ PriceMidday15 	+ PriceEvening16 	+ AbsChg1718Midd 	+ PriceTrendMidd4Yr 	+ PriceTrendMidd2Yr 	+ PriceMorning17 
+```
+
+```{r final preparation of data, include=FALSE, echo=FALSE, cache = TRUE}
+parking_geo_for_prep <- parking_geo_6 %>% dplyr::filter(Parking_Spaces != 0 ) %>% select(occRate, isFull, Unitdesc,Study_Area, Construction 	, Event.Closure 	, Study_Area_Condensed 	, Study.Year 	, peakHour 	, hour 	, month 	, dtw 	, meanOccRateThisHrThisBlkfc 	, meanOccRateLastHrThisBlkfc 	, meanOccRateNextHrThisBlkfc 	, avgYearOccRateByBlockPctChange 	, meanOccRateThisBlkfc 	, morningRush 	, eveningRush 	, workLunch 	, postWork 	, peakHour 	, springSeas 	, summerSeas 	, weekday 	, monThurs 	, fri 	, ARTCLASS 	, ARTCLASS 	, SPEEDLIMIT 	, ONEWAY 	, SURFACEWID 	, SURFACETYP 	, STREETTYPE 	, TRANCLASS 	, PVMTCONDIN 	, SLOPE_PCT 	, avgDist10BuildingPermits 	, avgDist10CommercialPermits 	, avgDist10DemoPermits 	, avgDist10InstitutionalPermits 	, avgDist10MultifamilyPermits 	, avgDist10NewConsPermits 	, avgDist10SingleFamPermits 	, avgDist15BuildingPermits 	, avgDist15CommercialPermits 	, avgDist15DemoPermits 	, avgDist15InstitutionalPermits 	, avgDist15MultifamilyPermits 	, avgDist15NewConsPermits 	, avgDist15SingleFamPermits 	, avgDist25BuildingPermits 	, avgDist25CommercialPermits 	, avgDist25DemoPermits 	, avgDist25InstitutionalPermits 	, avgDist25MultifamilyPermits 	, avgDist25NewConsPermits 	, avgDist25SingleFamPermits 	, avgDist2BuildingPermits 	, avgDist2CommercialPermits 	, avgDist2DemoPermits 	, avgDist2InstitutionalPermits 	, avgDist2MultifamilyPermits 	, avgDist2NewConsPermits 	, avgDist2SingleFamPermits 	, avgDist5BuildingPermits 	, avgDist5CommercialPermits 	, avgDist5DemoPermits 	, avgDist5InstitutionalPermits 	, avgDist5MultifamilyPermits 	, avgDist5NewConsPermits 	, avgDist5SingleFamPermits 	, mean5NNavgYearOccRateByBlockPctChange 	, mean5NNlatestYr 	, mean5NNearliestYr 	, mean5NNmeanOccRateThisBlkfc 	, mean5NNwtdAvgYearOccRateByBlockPctChange 	, mean5NNwtdLatestYr 	, mean5NNwtdEarliestYr 	, mean5NNwtdmeanOccRateThisBlkfc 	, PriceMorning18 	, PriceMorning16 	, PriceMidday17 	, PriceEvening18 	, PriceEvening15 	, AbsChg1718Eve 	, PriceTrendEve4Yr 	, PriceTrendEve2Yr 	, PriceMorning15 	, PriceMidday16 	, PriceEvening17 	, AbsChg1718Morn 	, PriceTrendMorn4Yr 	, PriceTrendMorn2Yr 	, PriceMidday18 	, PriceMidday15 	, PriceEvening16 	, AbsChg1718Midd 	, PriceTrendMidd4Yr 	, PriceTrendMidd2Yr 	, PriceMorning17 ) 
+```
+
+```{r partition into training and test such that training is years 2014-2017 and test is year 2018, include=FALSE, cache = TRUE}
+training <- parking_geo_for_prep %>% dplyr::filter(Study.Year != 2018)
+test <- parking_geo_for_prep %>% dplyr::filter(Study.Year == 2018)
+```
+
+```{r fit models on 2018 data and cross-validating, include=FALSE, cache = TRUE}
+fitControl <- trainControl(method = "cv", number = 2)
+
+set.seed(825)
+
+lmFitLin <- train(regFormula, data = test, 
+               method = "lm", 
+               trControl = fitControl, na.action = na.omit)  #, na.action = na.omit
+lmFitBinLog <- train(regFormula_1, data = test, 
+               method = "multinom", 
+               trControl = fitControl, na.action = na.omit)  #, na.action = na.omit
+```
+
+```{r create subset of test dataset incl only those obs that arent NA just like omitted in the model through na omit, include=FALSE, cache = FALSE}
+testOmit <- test %>% filter_all(all_vars(!is.na(.)))
+```
+
+```{r VIZPREP -- create parking_geo_firsts, map of distinct blockfaces, include=FALSE, echo=FALSE, cache = TRUE}
+parking_geo_firsts <-
+  parking_geo %>%
+  group_by(Unitdesc) %>%
+  arrange(Unitdesc, Date.Time) %>%
+  filter(row_number()==1)
+```
+
+#Introduction
+
+The search for parking is a struggle that drivers in large cities know all too well.  It costs drivers on average 17 hours of time per year, and in Seattle, this number increases to a whopping 58.  Much of this time is spent in a process known as "cruising for parking", in which a driver will slowly and repeatedly circle a block waiting for a space to open up.  Noted parking researcher Donald Shoup of UCLA has found that 30% of all car traffic on busy downtown streets are cruising for parking, and researchers at the University of Washington have found that this number is actually 35% in Seattle.  This amounts to an incredible amount of unnecessary congestion and pollution in densely populated areas.
+
+Reducing the practice of cruising for parking would be a public good, and one way to achieve this is by giving drivers better information about how likely they are to find an open parking space at their destination before they actually commit to driving there and finding out for themselves.  A driver who knows that their destination will likely be full when they arrive may elect to walk, bike, or take public transit instead.  Whether a block is full or not is the relevant piece of information to a driver considering driving to a destination, and this analysis develops a model to provide drivers with this information.  Specifically, this model aims to predict whether or not a blockface is likely to be full at a driver's desired destination at a driver's desired time.
+
+#Data
+
+This analysis uses Seattle as a use case to take advantage of data collected by Seattle's Department of Transportation's annual parking study, conducted from 2010-2017, although with data only available between 2014 and 2018.  The dataset upon which we build our model consists of observations of occupancy (number of spaces occupied over total spaces available) by blockface (one side of a segment of a city block).  These observations are collected for each blockface several days each year, generally on a weekday in the summer or spring.  Seattle is chosen for the availability of parking data, the availability of supplementary data through the city's advanced OpenData platform, and the degree to which parking congestion represents a significant problem -- as mentioned before, Seattle ranks fourth in amount of time spent by residents searching for parking.  Blockfaces used in this study are those observed in the annual parking study.  This has an added beenfit -- since Seattle has been reactively adjusting their parking price rates in response to previous year's occupancy data, we can also measure as an input the extent to which changing parking rates depresses or encourages future occupancy.  
+
+This dataset has several shortcomings. Because each blockface is only measured once per year, at the same time of year each year, (and blockfaces in a neighborhood are typically all measured on the same days), it is impossible to measure the impact of seasonality on parking demand.  This also rules out the possiblity of including occupancy rates on days prior to the desired blockface-hour combination as a predictor.  Ultimately, this limits the scope of predictions made by the model -- if a driver is desiring to park in one of the studied spots on one of the weekdays near when observations of that spot were recorded, this model can make a prediction for that; if the driver desires to park somewhere during wintertime, there is not telling how accurately or inaccurately this model would perform.    
+
+##Unit of Analysis: The Blockface By Hour 
+
+The unit of analysis, upon which predictions are made is the blockface-hour, a given blockface at a given hour.  Occupancy rates at this block face can range from 0 (completely empty) to 1 (completely full), and even beyond 1 in cases where more cars are parked than the are allowed by law.  Occupancy rates are the primary input data taken into this analysis, but since this study only aims to predict whether a block is full or not, not the precise degree to which a block is full, this occupancy rate data is transformed such that an occupancy greater than 1 is registered as "Full" and an occupancy less than 1 is registered as "Not Full". 
+
+####Map of all streets that are in parking study with occupancy rates
+
+Below is a map of all blockfaces for which observations have been measured over the past several years.  There is little change in the composition of blockfaces studied from one year to the next.  As is evident from this map, the majority of paid parking which were observed for this data set are located in downtown, with small commercial nodes farther from the center.
+
+```{r map with a basemap of all streets that are in parking study, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+ggplot() +
+  annotation_map_tile(type = "cartolight") +
+  layer_spatial(parking_geo_firsts,fill=NA, colour="black", size=1) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+```
+
+Below is a map depicting occupancy rates for all blockfaces.  As one would expect, streets closer to the center of the city tend to have higher occupancy rates.
+
+```{r map of occupancy rates, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+ggplot(cbind(lmFitBinLog$finalModel$fitted.values,lmFitBinLog$finalModel$residuals,testOmit) %>% group_by(Unitdesc) %>% summarize(percentOfSpotsFull = mean(as.integer(isFull))-1)) + 
+  annotation_map_tile(type = "cartolight") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+  geom_sf(aes(col = percentOfSpotsFull),fill = NA) +
+  scale_colour_gradientn(colours=rainbow(2))+
+  mapTheme()
+```
+
+
+####Histogram of Vacancy Rates
+
+Below is a histogram of occupancy rates by blockface-hours.  This histogram shows a peak at 100% occupancy, as well as a relatively even dispersion at occupancy rates below 100%.  The most curious part of this histogram is the large positive tail -- there are a fair amount of blockfaces with occupancy between 100% and 200%, as well as a few with occupancy rates stretching up to 500%.  These are representative of extreme demand, so high that cars are parked illegally.
+
+```{r create histogram of vacancy rates, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+hist(parking_geo$occRate)
+```
+
+##Independent Variables
+
+This analysis incorporates several independent variables representing the conditions of the street, the neighborhood, and the time and date.  Attributes of the blockface-hour include the presence of construction or an unusual public event at the time and place of the observation, as well as present and past parking price rates at that hour.  Attributes of the street include slope, pavement condition, presence of a transit line, level of traffic, and speed limimt.  Attributes of the surrounding neighborhood include the neighborhood in which the blockface is located and the distance to new development, in aggregate or broken down into different types of development (single family, multifamily, commercial, etc).  Attributes of the time and date include the hour of observation, season, day of the week, and occurrence during or not during rush hour.
+
+However, the most important predictors of occupancy are spatially and temporally lagged observations of occupancy.  These include average occupancy rates at the given blockgroup in the past, at the given blockgroup at the given time in the past, at the given blockgroup during preceding and suceeding hours in the past, at nearby blockgroups in the past, and at nearby blockgroups at the given time in the past. Observations of nearby blockgroups are included both weighted by distance from the blockgroup in question and unweighted.
+
+While there are objections to using past occupancy observations as predictors, we feel that their use is justified and is conceptually similar to say the use of comparables in the prediction of home prices.  A large difference between comparable sales prices is that comparables can be measured at a snapshot in time, rather than this full 2014-2018 dataset which has a temporal component (obviously it does not make sense to predict 2014 occupancy from 2018 occupancy measurements.)  This study gets around this by using 2014-2017 measurements as predictors, and only testing the model on 2018 values.  Effectively, this study aims to predict 2018 values from the data which would be available from the prior few years.  
+
+Another objection to predicting occupancy through the use of temporal and spatially lagged occupancy measures is that it would make predictions overly specific and not generalizable in the event that some sort of sea change were to drastically change parking demand dynamics in the future, rendering past occupancy observations unrepresentative of future occupancy observations.  The alternative would be to concentrate on using, as inputs, variables which have a more general and more removed relationship with parking occupancy itself, such as new development or new business formation or increased population density of car ownership in an area.  
+
+While this is certainly a concern, it is not one that we feel is strong enough to argue against the inclusion of lagged dependent variables as predictors.  We decide this because we believe that a true sea change would be unlikely to occur with the immediacy necessary to make our past observations wholly unpredictive of future observations, and that any significant shift in parking demand dynamics would likely play out over several years, by which point it would be gradually incorporated into the temporally lagged occupancy rate predictors.  Furthermore, by incorporating change in occupancy rates over the prior several years as its own variable, we feel would be able to better capture the impact of any sea change in current occupancy rates.  
+
+Additionally, using past occupancy rates also significantly benefits our analysis by capturing all of the location specific (although time non-specific) variables which distinguish each place.  These include all of the peculiarities of nearby business communities, residential populations, idiosyncratic amenities and disamenities -- in essence all of the intangibles which make each blockface specific.  While the use of neighborhood dummy variables captures some of this variation, capturing more granular variation on the sub-neighborhood level would require a multitude of independent variables to approximate, and many of these more intangible variables would be almost impossible to quantify and incorporate.  Adding occupancy rates specific to the level of the blockface (or few nearby blockfaces) allows us to capture this high-resolution spatial variation, leaving only variation which is specific to both time and location (such as level of new development between 2014 and 2018).
+
+That said, we certainly recognize value in incorporating other predictors into our model.  New development is the chief independent variable that we incorporate as a predictor, and we incorporate as variables proximity to development and other types of permits at several differnt levels, specifically average distance to a varying number of nearest neighboring new development permits.  These measures are additionally broken down by type of development (residential, commercial, and institutional).
+
+#Methods
+
+Since we are attempting to predict a binary outcome: whether a blockface is full or not full, we felt it best to use a logistic regression.  After converting occupancy rate to a "full or not full", we then calculate a regression formula regressing this "IsFull" variable by the selected independent variables.  We then separate out a test set consisting of only those observations from 2018.  This test set is then repeatedly partitioned and a logistic regression is performed.  To cross-validate to an appropriate degree, 20 iterations are performed.  The results of these repeated resamplings and recalculations are then analyzed for accuracy, specificity, and sensitivity.  Since this is a binary regression, the quality of the model is then assessed based on its ability to correctly distinguish between full and not full blockfaces in a way that suits our goals as researchers.  This involves determining a cutoff point at which a prediction is classified as likely true or likely false.  For example, a test diagnosing cancer might use a very low cutoff point, such that even a ten percent likelihood of a positive would be classified as a positive prediction. In this particular use case, potential consequences of neither false negatives (showing up to a blockface predicted to be not full and finding it to be full) nor false positives (deciding not to travel to a predicted full blockface which was not in actuality full) are anywhere near as dire as that of the prior example.  As such, we are not predisposed to prefer either false positives or false negatives, and as no cutoff point produces a better accuracy rate than that of a 50% cutoff, we choose to go with the 50% cutoff.
+
+#Results
+
+##General Performance
+
+Our model predicts with an accuracy of roughly 70% after cross-validation.  Of block groups which are full (comprising 37% of the sample), a sensitivity rate of 54% is achieved (this number computed by dividing the percentage share of correctly predicted full blockgroups, 20%, by the total percentage share of full blockgroups, i.e. the 20% correctly predicted plus the 17% percentage share of full block groups incorrectly predicted to be not full).  Conversely, a specificity rate of 82% is calculated by dividing the 50% of all block groups which are not full and predicted as so, by that 50% plus the 11% that are incorrectly predicted as full despite being not full.  
+
+####Coefficient Table
+
+```{r VIZ -- Coefficient table, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+kable(as.data.frame(summary(lmFitBinLog)$coefficients), digits = 3, col.names = list("Coefficient")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+Above is a table presenting coefficients of the many different variables.  Since this use case is focused solely on predictive power rather than teasing out individual relationships between predictors and dependent variable, this analysis takes an expansive approach toward inclusion of variables.  As a result, many of the predictors add little in terms of predictive power but are left in since they do not detract from predictive power.  In the process of experimentally adding variables in to the model, the largest jumps in predictive power came from variables relating to proximity to new development, past occupancy rates at similar time of day and geography, and price rates.
+
+####Mean Accuracy
+
+Mean accuracy is roughly 70%, meaning that 70% of blockface-hour observations were correctly classified as full or not full.
+
+```{r VIZ -- Accuracy, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+lmFitBinLog$resample %>% as.data.frame() %>% summarize(meanAccuracy = mean(Accuracy)) %>% kable(digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Accuracy
+
+Below are several tables and charts depicting the confusion matrix statistics of the model.  Of the 70% percentage share of correct identifications, 50% percentage share are correct identifications of not full blocks while 20% percentage share are correct identificatoins of full blocks.  Of the remaining 30% percentage share, 17% percentage share is false negatives (full but predicted to be not full), while 11% percentage share is false positives (not full but predicted to be full).
+
+####Confusion Matrix Table
+
+```{r VIZ -- Confusion Matrix Table, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+cbind(lmFitBinLog$finalModel$fitted.values,lmFitBinLog$finalModel$residuals,testOmit) %>% st_set_geometry(NULL) %>% mutate(predictedFull = if_else(lmFitBinLog.finalModel.fitted.values > .5, 1, 0)) %>% group_by(isFull,predictedFull) %>% summarize(count_ = n()) %>% mutate(count_ = as.integer(100*count_/17877), catName = if_else(isFull == 0 & predictedFull == 0, "True Negative",if_else(isFull == 1 & predictedFull == 0, "False Negative",if_else(isFull == 0 & predictedFull == 1, "False Positive",if_else(isFull == 1 & predictedFull == 1, "True Positive",""))))) %>% mutate(Percentage = count_, Category = catName, Outcome = if_else(isFull == 0, "Isn't Full","Is Full")) %>% ungroup() %>% dplyr::select(Percentage, Category, Outcome) %>% arrange(Category) %>% kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) 
+```
+
+####Confusion Matrix
+
+```{r VIZ -- Confusion Matrix, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+confusionMatrix.train(lmFitBinLog)
+```
+
+####Confusion Matrix Barplot
+
+```{r VIZ -- Confusion Matrix Barplot, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+cbind(lmFitBinLog$finalModel$fitted.values,lmFitBinLog$finalModel$residuals,testOmit) %>% st_set_geometry(NULL) %>% mutate(predictedFull = if_else(lmFitBinLog.finalModel.fitted.values > .5, 1, 0)) %>% group_by(isFull,predictedFull) %>% summarize(count_ = n()) %>% mutate(count_ = as.integer(100*count_/17877), catName = if_else(isFull == 0 & predictedFull == 0, "True Negative",if_else(isFull == 1 & predictedFull == 0, "False Negative",if_else(isFull == 0 & predictedFull == 1, "False Positive",if_else(isFull == 1 & predictedFull == 1, "True Positive",""))))) %>% select(count_, catName) %>% ggplot(., aes(x=catName, y=count_)) + geom_bar(stat = "identity") + theme_classic() + labs(title ="Distribution of Predictions by Accuracy and Direction", x = "Category", y = "Percentage") 
+```
+
+##Variation in Performance
+
+However, it is important to break down these metrics by location (neighborhood) and time of day to see where this model is most and least accurate, and to see how widely performance of the model varies upon different observations.
+
+####Fitted vs Residual vs Observed by Study Area
+
+```{r fitted vs residual vs observed by study area, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+cbind(lmFitBinLog$finalModel$fitted.values,lmFitBinLog$finalModel$residuals,testOmit) %>% st_set_geometry(NULL)%>% group_by(Study_Area) %>% summarize(meanFittedValue = mean(lmFitBinLog.finalModel.fitted.values),
+                                                                                                                         meanAbsoluteResidual = mean(abs(lmFitBinLog.finalModel.residuals)),
+                                                                                                                         percentOfSpotsFull = mean(as.integer(isFull))-1) %>% kable(digits = 2, col.names = list("Study Area","Mean Predicted Value", "Mean Absolute Value Residual", "Proportion of Spots Actually Full")) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r map of average residuals by blockface, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+ggplot(cbind(lmFitBinLog$finalModel$fitted.values,lmFitBinLog$finalModel$residuals,testOmit) %>% group_by(Unitdesc) %>% summarize(meanAbsoluteResidual = mean(abs(lmFitBinLog.finalModel.residuals)))) + 
+  annotation_map_tile(type = "cartolight") +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+  geom_sf(aes(col = meanAbsoluteResidual),fill = NA) +
+  scale_colour_gradientn(colours=rainbow(2))+
+  mapTheme()
+```
+
+The chart and map above display predicted values, actual values, and residuals by neighborhood.  With the exception of Ballard Locks neighborhood (small sample size), we can see a real pattern emerge from the data.  Reinforcing the finding from the earlier map of occupancy rates, we can see that the neighborhoods with the highest actual occupancy rates are Cherry Hill, Chinatown, Denny Triangle, First Hill, Pike-Pine, Pioneer Square, and Uptown -- all downtown or adjacent to it.  Notably, higher occupancy rates correlate with absolute values of residuals -- the Pearson correlation coefficient between the two is 84%.  This fits with the far higher observed specificity rate than sensitivity rate. 
+
+####Fitted vs Residual vs Observed by Hour
+
+```{r fitted vs residual vs observed by hour, include=TRUE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+cbind(lmFitBinLog$finalModel$fitted.values,lmFitBinLog$finalModel$residuals,testOmit) %>% st_set_geometry(NULL)%>% group_by(hour) %>% summarize(meanFittedValue = mean(lmFitBinLog.finalModel.fitted.values),
+                                                                                                                                                  meanAbsoluteResidual = mean(abs(lmFitBinLog.finalModel.residuals)),
+                                                                                                                                                  percentOfSpotsFull = mean(as.integer(isFull))-1) %>% kable(digits = 2, col.names = list("Hour","Mean Predicted Value", "Mean Absolute Value Residual", "Proportion of Spots Actually Full")) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed")) 
+```
+
+The chart above displays predicted values, actual values, and residuals by hour of day.  A similar pattern can be seen as when analyzing accuracy by neighborhood.  Times of low occupancy are morning rush hour, afternoon rush hour, and late night, with periods of high occupancy in between (midday and evening).  These are also the times of highest residuals, again because the model tends to err towards predicting lower likelihood of a blockface being full.
+
+
+```{r Residuals by Hour and Blockface, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+cbind(lmFitBinLog$finalModel$fitted.values,lmFitBinLog$finalModel$residuals,testOmit) %>% st_set_geometry(NULL)%>% group_by(hour, Study_Area) %>% summarize(meanFittedValue = mean(lmFitBinLog.finalModel.fitted.values),
+                                                                                                                                                            meanAbsoluteResidual = mean(abs(lmFitBinLog.finalModel.residuals)),
+                                                                                                                                                            percentOfSpotsFull = mean(as.integer(isFull))-1) %>% dplyr::select(hour, Study_Area, meanAbsoluteResidual)%>% spread(hour,meanAbsoluteResidual) %>% kable(digits = 2) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+
+
+```{r blank, include=FALSE}
+```
+
+#Conclusions
+This model can forecast the likelihood of a given blockface being full or not full at a given time on a weekday.  To the extent that drivers consult it before deciding whether to set out on a trip, this tool could reduce the number of drivers who arrive at their destination to find no empty spaces.  Doing so would reduce congestion on the road, reduce the emissions produced in crowded neighborhoods, and save time on the part of the driver.  If this model can help to achieve this end, then it could be considered a success.  
+
+That said, there are some shortcomings to it.  The limited dataset reduces the generalizability of the model to blockfaces outside of the study area and date-times outside of those few days per year that were observed for the study data.  Additionally, it does not take into account real time information, which could improve forecasting ability to respond to unexpected events.  Improvements to model and data would allow for more accuracy in prediction and better usability.  
